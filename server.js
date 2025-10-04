@@ -28,7 +28,7 @@ const app = express();
 app.use(express.json({ limit: JSON_LIMIT }));
 
 const PORT = process.env.PORT || 8081;
-const BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
+const BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const API_KEY = process.env.API_KEY || undefined;
 const ASSET_BASE_URL = (process.env.ASSET_BASE_URL || 'https://cdn.jsdelivr.net/gh/Earth-J/cdn-files@main').replace(/\/$/, '');
 
