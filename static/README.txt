@@ -1,0 +1,1 @@
+ใส่ไฟล์ sample.gif ไว้ที่นี่เพื่อให้ endpoint /static/sample.gif ทำงานสำหรับเดโม 
