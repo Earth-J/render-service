@@ -93,23 +93,20 @@ function resolveCdnUrlByLayer(layer) {
     case 'floor':
       url = `${ASSET_BASE_URL}/floor/${key}.png`;
       break;
+    case 'tile':
+      url = `${ASSET_BASE_URL}/tile/${key}.png`;
+      break;
     case 'furniture':
       url = `${ASSET_BASE_URL}/furniture/${key}.png`;
       break;
-    case 'wallpaper-left':
-    case 'wallpaper_left':
-    case 'wallpaperLeft':
-      url = `${ASSET_BASE_URL}/wallpaper/left/${key}.png`;
-      break;
-    case 'wallpaper-right':
-    case 'wallpaper_right':
-    case 'wallpaperRight':
-      url = `${ASSET_BASE_URL}/wallpaper/right/${key}.png`;
+    case 'window-overlay':
+      // Use direct CDN URLs for window overlays
+      url = layer.url || null;
       break;
     default:
       url = null;
   }
-  rdbg('resolveCdnUrlByLayer', { type: layer.type, key, url });
+  rdbg('resolveCdnUrlByLayer', { type: layer.type, key, url, originalKey: layer.key });
   return url;
 }
 
@@ -154,7 +151,11 @@ function parseDataUrl(dataUrl) {
 function fetchBuffer(url) {
   const key = `buf:${url}`;
   const cached = bufferCache.get(key);
-  if (cached) return Promise.resolve(cached);
+  if (cached) {
+    rdbg('fetchBuffer.cacheHit', { url, size: cached?.length });
+    return Promise.resolve(cached);
+  }
+  rdbg('fetchBuffer.fetching', { url });
   // support data: URLs
   if (url.startsWith('data:')) {
     const buf = parseDataUrl(url);
@@ -168,6 +169,14 @@ function fetchBuffer(url) {
       const lib = isHttps ? https : http;
       const agent = isHttps ? httpsAgent : httpAgent;
       const req = lib.get(url, { agent }, (res) => {
+        // รองรับ redirect (301, 302, 303, 307, 308)
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          rdbg('fetchBuffer.redirect', { url, status: res.statusCode, location: res.headers.location });
+          req.destroy(); // ปิด connection เดิม
+          // เรียก recursive เพื่อ follow redirect
+          return fetchBuffer(res.headers.location).then(resolve).catch(reject);
+        }
+        
         if (res.statusCode && res.statusCode >= 400) {
           rdbg('fetchBuffer.httpError', { url, status: res.statusCode });
           return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
@@ -176,6 +185,7 @@ function fetchBuffer(url) {
         res.on('data', (d) => chunks.push(d));
         res.on('end', () => {
           const buf = Buffer.concat(chunks);
+          rdbg('fetchBuffer.success', { url, size: buf?.length, status: res.statusCode });
           bufferCache.set(key, buf, CACHE_TTL_MS);
           resolve(buf);
         });
@@ -199,14 +209,73 @@ function swapImageExtension(url) {
   return null;
 }
 
+function swapFurnitureDirection(url) {
+  if (!url) return null;
+  
+  // รองรับทั้ง _right/_left และ -right/-left
+  // สำหรับเฟอร์นิเจอร์ที่ถูก flip ให้ลองเปลี่ยนทิศทาง
+  
+  // กรณีใช้ขีดกลาง (-) - แก้ regex ให้แม่นยำขึ้น
+  if (/(?:^|\/)([^\/]+)-right\.(png|gif)(\?.*)?$/i.test(url)) {
+    return url.replace(/([^\/]+)-right\.(png|gif)(\?.*)?$/i, '$1-left.$2$3');
+  }
+  if (/(?:^|\/)([^\/]+)-left\.(png|gif)(\?.*)?$/i.test(url)) {
+    return url.replace(/([^\/]+)-left\.(png|gif)(\?.*)?$/i, '$1-right.$2$3');
+  }
+  
+  // กรณีใช้ขีดล่าง (_) - แก้ regex ให้แม่นยำขึ้น
+  if (/(?:^|\/)([^\/]+)_right\.(png|gif)(\?.*)?$/i.test(url)) {
+    return url.replace(/([^\/]+)_right\.(png|gif)(\?.*)?$/i, '$1_left.$2$3');
+  }
+  if (/(?:^|\/)([^\/]+)_left\.(png|gif)(\?.*)?$/i.test(url)) {
+    return url.replace(/([^\/]+)_left\.(png|gif)(\?.*)?$/i, '$1_right.$2$3');
+  }
+  
+  // ถ้าไม่มี suffix ให้ลองเพิ่ม _right หรือ -right
+  if (/(?:^|\/)([^\/]+)\.(png|gif)(\?.*)?$/i.test(url) && !/-left|-right|_left|_right/i.test(url)) {
+    // ลองใช้ขีดล่างก่อน (ตามไฟล์ที่คุณมี)
+    return url.replace(/([^\/]+)\.(png|gif)(\?.*)?$/i, '$1_right.$2$3');
+  }
+  
+  return null;
+}
+
+
 async function fetchImageWithFallback(url) {
   try {
+    rdbg('fetchImageWithFallback.trying', { url });
     return await fetchBuffer(url);
   } catch (e) {
+    rdbg('fetchImageWithFallback.failed', { url, error: e?.message });
+    // ลองเปลี่ยนนามสกุลไฟล์ก่อน
     const alt = swapImageExtension(url);
     if (alt) {
-      rdbg('fetchImageWithFallback.alt', { url, alt });
-      return await fetchBuffer(alt);
+      try {
+        rdbg('fetchImageWithFallback.alt', { url, alt });
+        return await fetchBuffer(alt);
+      } catch (altError) {
+        // ถ้าเปลี่ยนนามสกุลไม่ได้ ลองเปลี่ยนชื่อไฟล์สำหรับ flip
+        const flipAlt = swapFurnitureDirection(url);
+        if (flipAlt) {
+          try {
+            rdbg('fetchImageWithFallback.flip', { url, flipAlt });
+            return await fetchBuffer(flipAlt);
+          } catch (flipError) {
+            // ถ้า flip ไม่ได้ ให้ลองนามสกุลของ flip
+            const flipAltExt = swapImageExtension(flipAlt);
+            if (flipAltExt) {
+              try {
+                rdbg('fetchImageWithFallback.flipExt', { url, flipAltExt });
+                return await fetchBuffer(flipAltExt);
+              } catch (finalError) {
+                throw e; // throw original error
+              }
+            }
+            throw e;
+          }
+        }
+        throw e;
+      }
     }
     throw e;
   }
@@ -229,12 +298,21 @@ async function composePng(width, height, layers, backgroundHex) {
     ctx.fillRect(0, 0, width, height);
   }
   const decoded = await mapWithConcurrency(layers, STATIC_FETCH_CONCURRENCY, async (layer) => {
-    if (!layer || !layer.url) return null;
+    if (!layer || !layer.url) {
+      rdbg('composePng.layerSkipped', { reason: 'no_layer_or_url', layer: layer ? { url: layer.url } : null });
+      return null;
+    }
     try {
+      rdbg('composePng.loading', { url: layer.url });
       const buf = await fetchImageWithFallback(layer.url);
+      rdbg('composePng.loaded', { url: layer.url, bufferSize: buf?.length });
       const img = await loadImageCached(layer.url, buf);
+      rdbg('composePng.imageReady', { url: layer.url, draw: layer.draw });
       return { img, draw: layer.draw || { x: 0, y: 0, w: width, h: height } };
-    } catch (e) { rdbg('composePng.loadSkip', { url: layer?.url, message: e?.message }); return null; }
+    } catch (e) { 
+      rdbg('composePng.loadSkip', { url: layer?.url, message: e?.message, error: e?.stack }); 
+      return null; 
+    }
   });
   for (const it of decoded) {
     if (!it) continue;
@@ -275,11 +353,11 @@ async function composeGif(width, height, layers, options) {
         maxFrames = Math.max(maxFrames, perFrame.length);
       }
     } else if (layer.url) {
-      try {
-        const buf = await fetchImageWithFallback(layer.url);
-        const img = await loadImageCached(layer.url, buf);
-        decodedLayers.push({ kind: 'static', img, draw: layer.draw || { x: 0, y: 0, w: width, h: height } });
-      } catch (e) { rdbg('composeGif.staticSkip', { url: layer.url, message: e?.message }); /* skip static */ }
+        try {
+          const buf = await fetchImageWithFallback(layer.url);
+          const img = await loadImageCached(layer.url, buf);
+          decodedLayers.push({ kind: 'static', img, draw: layer.draw || { x: 0, y: 0, w: width, h: height } });
+        } catch (e) { rdbg('composeGif.staticSkip', { url: layer.url, message: e?.message }); /* skip static */ }
     }
   }
 
@@ -302,10 +380,16 @@ async function composeGif(width, height, layers, options) {
   const ctx = canvas.getContext('2d');
 
   for (let i = 0; i < maxFrames; i++) {
-    if (backgroundHex) {
+    // Clear canvas ก่อนวาดเฟรมใหม่
+    ctx.clearRect(0, 0, width, height);
+    
+    // ถ้ามี background color ให้เติมก่อน (จะเป็นสีพื้นหลังสำหรับพื้นที่ที่ไม่มี layer ครอบคลุม)
+    if (backgroundHex && !wantTransparent) {
       try { ctx.fillStyle = backgroundHex; } catch (_) { /* ignore invalid */ }
       ctx.fillRect(0, 0, width, height);
     }
+    
+    // วาด layers ทับ
     for (const l of decodedLayers) {
       if (l.kind === 'static') {
         const d = l.draw;
@@ -317,9 +401,9 @@ async function composeGif(width, height, layers, options) {
         ctx.drawImage(f.img, d.x || 0, d.y || 0, d.w || width, d.h || height);
       }
     }
+    
     const rgba = ctx.getImageData(0, 0, width, height).data;
     encoder.addFrame(rgba);
-    ctx.clearRect(0, 0, width, height);
   }
 
   encoder.finish();
@@ -475,11 +559,15 @@ app.post('/jobs', auth, async (req, res) => {
         } else {
           const directUrl = l.url ? String(l.url) : null;
           const url = directUrl || resolveCdnUrlByLayer(l);
-          if (!url) continue;
+          if (!url) {
+            rdbg('job.layer.skipped', { jobId, type: l.type, key: l.key, reason: 'no_url' });
+            continue;
+          }
           resolvedLayers.push({ type: 'static', url, draw: l.draw });
+          rdbg('job.layer.resolved', { jobId, type: l.type, key: l.key, url });
         }
       }
-      rdbg('job.layers.resolved', { jobId, count: resolvedLayers.length });
+      rdbg('job.layers.resolved', { jobId, count: resolvedLayers.length, layers: resolvedLayers.map(l => ({ type: l.type, url: l.url, draw: l.draw })) });
 
       // เริ่มงาน render ภายใต้ concurrency limit และผูก promise ไว้สำหรับ de-dup
       const renderPromise = (async () => {
@@ -488,13 +576,14 @@ app.post('/jobs', auth, async (req, res) => {
           // ตัดสินใจฟอร์แมตจริงตามเลเยอร์
           const hasFrames = resolvedLayers.some(l => String(l.type) === 'pet_gif_frames');
           if (wantsGif && hasFrames) {
-            const { format, buffer } = await composeGif(width, height, resolvedLayers, payload.gifOptions || {});
+            const gifOptions = { ...(payload.gifOptions || {}) };
+            const { format, buffer } = await composeGif(width, height, resolvedLayers, gifOptions);
             const ext = (format === 'gif') ? 'gif' : 'png';
             const outPath = path.join(outDir, `${cacheKey}.${ext}`);
             await fsp.writeFile(outPath, buffer);
             return `${BASE_URL}/out/${path.basename(outPath)}`;
           } else {
-            const pngBuf = await composePng(width, height, resolvedLayers, payload.backgroundColorHex || (payload.gifOptions && payload.gifOptions.backgroundColorHex) || '')
+            const pngBuf = await composePng(width, height, resolvedLayers, payload.backgroundColorHex || (payload.gifOptions && payload.gifOptions.backgroundColorHex) || '');
             const outPath = path.join(outDir, `${cacheKey}.png`);
             await fsp.writeFile(outPath, pngBuf);
             return `${BASE_URL}/out/${path.basename(outPath)}`;
